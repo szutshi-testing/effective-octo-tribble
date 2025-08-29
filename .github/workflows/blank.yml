@@ -1,0 +1,141 @@
+on:
+  workflow_dispatch:
+    inputs:
+      COPILOT_AGENT_APP_ID:
+        description: 'The GitHub app ID, used to mint the tokens. If not present, no secrets will be injected.'
+        required: false
+        type: string
+      COPILOT_AGENT_ARTIFACT_REPO:
+        description: 'The repo that holds the agent binary.'
+        required: true
+        type: string
+      COPILOT_AGENT_ARTIFACT_VERSION:
+        description: 'The release version of the artifact'
+        required: true
+        type: string
+      COPILOT_AGENT_ACTOR_ID:
+        description: 'The actor assigned to this run, used in user-token generation.'
+        required: true
+        type: string
+      PR_NUMBER:
+        description: 'The PR number'
+        required: true
+        type: string
+# on: dynamic
+name: << .Name >>
+
+jobs:
+  agent:
+    name: Agent
+    runs-on: << .RunsOn >>
+    steps:
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download autofind cli
+      run: |
+        gh release download ${{ github.event.inputs.COPILOT_AGENT_ARTIFACT_VERSION }}
+        chmod +x autofind
+      env:
+        GH_REPO: ${{ github.event.inputs.COPILOT_AGENT_ARTIFACT_REPO }}
+        GH_TOKEN: ${{ secrets.GITHUB_AGENT_ARTIFACT_REPO_TOKEN }}
+
+    - name: Get PR diff
+      run: |
+        gh pr diff ${{ github.event.inputs.PR_NUMBER }} > pr_diff.txt
+        cat pr_diff.txt
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build extra.json
+      run: |
+        gh pr view ${{ github.event.inputs.PR_NUMBER }} --json title,body | \
+        jq --arg pr_number "${{ github.event.inputs.PR_NUMBER }}" \
+           --arg actor_id "${{ github.event.inputs.COPILOT_AGENT_ACTOR_ID }}" \
+           --arg job_id "${{ github.event.inputs.JOB_ID }}" \
+           --arg tenant "${{ github.event.inputs.TENANT }}" \
+           --arg repo_url "https://github.com/${{ github.repository }}" '{
+          pr_title: .title,
+          pr_body: .body,
+          pr_number: ($pr_number | tonumber),
+          repo: $repo_url,
+          github_user: $actor_id,
+          job_id: $job_id,
+          tenant: $tenant
+        }' > extra.json
+        jq '.' extra.json || true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build files.json
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        REPO=${{ github.repository }}
+        PR=${{ github.event.inputs.pr_number }}
+
+        PR_JSON=$(gh api "repos/$REPO/pulls/$PR")
+        BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha')
+        HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+        echo "BASE_SHA=$BASE_SHA"
+        echo "HEAD_SHA=$HEAD_SHA"
+
+        git fetch --no-tags origin "$BASE_SHA" --depth=1 || true
+        git fetch --no-tags origin "$HEAD_SHA" --depth=1 || true
+
+        git diff --name-status -M "$BASE_SHA" "$HEAD_SHA" \
+        | while IFS=$'\t' read -r status p1 p2; do
+            [ -z "${status:-}" ] && continue
+            case "$status" in
+              A) new="$p1"; old="";;
+              M) new="$p1"; old="$p1";;
+              D) new="";   old="$p1";;
+              R*) new="$p2"; old="$p1";;
+              *) new="$p1"; old="$p1";;
+            esac
+            [ "$status" = "D" ] && continue
+
+            patch=$(git diff -U0 "$BASE_SHA" "$HEAD_SHA" -- "$new" 2>/dev/null || true)
+
+            regions=$(printf "%s\n" "$patch" \
+              | grep '^@@' \
+              | grep -o '+[0-9][0-9]*\([,][0-9][0-9]*\)\?' \
+              | sed 's/^+//' \
+              | awk -F',' '{c=($2==""?1:$2); s=$1; e=s+c-1; print "["s","e"]"}')
+
+            contents=$(git show "${HEAD_SHA}:${new}" 2>/dev/null || echo "")
+            baseContents=""
+            if [ "$status" != "A" ]; then
+              basePath=${old:-$new}
+              baseContents=$(git show "${BASE_SHA}:${basePath}" 2>/dev/null || echo "")
+            fi
+
+            jq -n \
+              --arg path "$new" \
+              --arg contents "$contents" \
+              --arg base "$baseContents" \
+              --arg regions_txt "$regions" '
+                {
+                  path: $path,
+                  contents: $contents
+                }
+                + (if $base == "" then {} else {baseContents:$base} end)
+                + (if $regions_txt == "" then {} else {
+                    regions: ([$regions_txt|split("\n")[]|select(length>0)]
+                              | map( (.[1:-1]|split(",")|map(tonumber)) ))
+                  } end)
+              '
+          done \
+        | jq -s '.' > files.json
+
+        echo "Created files.json (size $(wc -c < files.json) bytes)"
+
+    - name: Run CodeML detector
+      run: |
+        ./autofind run --extra extra.json --files files.json --detector ccr_new --options '{"maxAlerts":10}' --model "capi-prod-o3-mini" --callback-url ${{ github.event.inputs.COPILOT_AGENT_CALLBACK_URL }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_COPILOT_API_TOKEN }}
+        CAPI_INTEGRATION_ID: ${{ secrets.GITHUB_COPILOT_INTEGRATION_ID }}
+        CAPI_DEV_KEY: ${{ secrets.CAPI_TOKEN }}
